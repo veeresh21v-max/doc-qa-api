@@ -1,8 +1,6 @@
 import os
-import uuid
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from pdf_extractor import extract_text_from_pdf, extract_text_from_txt
@@ -10,15 +8,15 @@ from rag import (
     chunk_text,
     store_document,
     retrieve_chunks,
-    build_rag_prompt,
     generate_answer,
     list_documents,
     delete_document,
+    get_harness_stats,
     count_tokens,
 )
 
 load_dotenv()
-app = FastAPI(title="AI Document Q&A API")
+app = FastAPI(title="AI Document Q&A API v2 — with Harness + Context Engineering")
 
 # ── Pydantic Models ────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
@@ -32,12 +30,13 @@ class SourceChunk(BaseModel):
     similarity: float
 
 class AskResponse(BaseModel):
-    document_id:   str
-    question:      str
-    answer:        str
-    source_chunks: list[SourceChunk]
-    input_tokens:  int
-    output_tokens: int
+    document_id:    str
+    question:       str
+    answer:         str
+    source_chunks:  list[SourceChunk]
+    input_tokens:   int
+    output_tokens:  int
+    budget_report:  dict    # NEW — context budget breakdown
 
 class UploadResponse(BaseModel):
     document_id:  str
@@ -49,85 +48,54 @@ class UploadResponse(BaseModel):
 # ── Endpoints ──────────────────────────────────────────────────────────────
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload a PDF or TXT file.
-    Extracts text, chunks it, embeds chunks, stores in ChromaDB.
-    Returns document_id for use in future /ask requests.
-    """
-    # Validate file type
     if not file.filename.endswith((".pdf", ".txt")):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF and TXT files are supported."
-        )
+        raise HTTPException(status_code=400, detail="Only PDF and TXT files supported.")
 
-    # Read file bytes
     file_bytes = await file.read()
 
-    # Extract text based on file type
     try:
-        if file.filename.endswith(".pdf"):
-            text = extract_text_from_pdf(file_bytes)
-        else:
-            text = extract_text_from_txt(file_bytes)
+        text = (extract_text_from_pdf(file_bytes)
+                if file.filename.endswith(".pdf")
+                else extract_text_from_txt(file_bytes))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Generate unique document ID
-    document_id = str(uuid.uuid4())[:8]
-
-    # Chunk the text
-    chunks = chunk_text(text, chunk_size=500, overlap=50)
-
-    # Count total tokens for reporting
-    total_tokens = sum(count_tokens(chunk) for chunk in chunks)
-
-    # Embed and store in ChromaDB
-    chunk_count = store_document(document_id, file.filename, chunks)
+    import uuid
+    document_id  = str(uuid.uuid4())[:8]
+    chunks       = chunk_text(text, chunk_size=500, overlap=50)
+    total_tokens = sum(count_tokens(c) for c in chunks)
+    chunk_count  = store_document(document_id, file.filename, chunks)
 
     return UploadResponse(
         document_id=document_id,
         filename=file.filename,
         chunk_count=chunk_count,
         total_tokens=total_tokens,
-        message=f"Document uploaded successfully. Use document_id '{document_id}' to ask questions."
+        message=f"Uploaded. Use document_id '{document_id}' to ask questions."
     )
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(request: AskRequest):
-    """
-    Ask a question about an uploaded document.
-    Retrieves relevant chunks and generates an answer using RAG.
-    """
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    # Retrieve relevant chunks from ChromaDB
     try:
-        chunks = retrieve_chunks(
-            document_id=request.document_id,
-            question=request.question,
-            top_k=request.top_k
-        )
+        chunks = retrieve_chunks(request.document_id, request.question, request.top_k)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    # Build RAG prompt with retrieved context
-    prompt = build_rag_prompt(request.question, chunks)
+    answer, input_tokens, output_tokens, budget_report = generate_answer(
+        question=request.question,
+        retrieved_chunks=chunks,
+    )
 
-    # Generate answer using Groq LLM
-    answer, input_tokens, output_tokens = generate_answer(prompt)
-
-    # Format source chunks for response
     source_chunks = [
         SourceChunk(
-            chunk_id=chunk["chunk_id"],
-            text=chunk["text"][:200] + "...",
-            # Return first 200 chars of each chunk
-            # Full text would make response too large
-            similarity=chunk["similarity"]
+            chunk_id=c["chunk_id"],
+            text=c["text"][:200] + "...",
+            similarity=c["similarity"]
         )
-        for chunk in chunks
+        for c in chunks
     ]
 
     return AskResponse(
@@ -137,31 +105,28 @@ async def ask_question(request: AskRequest):
         source_chunks=source_chunks,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        budget_report=budget_report,
     )
 
 @app.get("/documents")
 async def get_documents():
-    """List all uploaded documents."""
     documents = list_documents()
-    return {
-        "documents":  documents,
-        "total_count": len(documents)
-    }
+    return {"documents": documents, "total_count": len(documents)}
 
 @app.delete("/documents/{document_id}")
 async def remove_document(document_id: str):
-    """Delete a document and all its chunks from ChromaDB."""
-    success = delete_document(document_id)
-    if not success:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Document {document_id} not found."
-        )
-    return {"message": f"Document {document_id} deleted successfully."}
+    if not delete_document(document_id):
+        raise HTTPException(status_code=404, detail=f"Document {document_id} not found.")
+    return {"message": f"Document {document_id} deleted."}
+
+@app.get("/stats")
+async def get_stats():
+    """
+    NEW endpoint — returns harness session stats.
+    Total calls, tokens used, cost, avg latency.
+    """
+    return get_harness_stats()
 
 @app.get("/health")
-async def health_check():
-    """Simple health check endpoint."""
-    return {"status": "healthy", "model": "llama-3.3-70b-versatile"}
-
-# Run: uvicorn main:app --reload
+async def health():
+    return {"status": "healthy", "version": "v2", "harness": "enabled"}
