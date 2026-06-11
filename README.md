@@ -45,3 +45,13 @@ Delete a document and all its chunks.
 2. Copy the document_id from the response
 3. Ask: POST /ask with document_id and your question
 4. Receive answer with source chunks and similarity scores
+
+## v2 Updates — Harness + Context Engineering
+
+- All LLM calls now route through LLMHarness class
+- Context budget allocation: chunks get 45% of available token budget
+- Automatic retry with exponential backoff on transient failures  
+- Fallback to llama-3.1-8b-instant if primary model fails
+- Structured logging on every LLM call
+- New /stats endpoint returns session-level cost and token usage
+- budget_report field in /ask response shows exact token allocation per call
